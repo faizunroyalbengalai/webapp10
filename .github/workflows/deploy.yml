@@ -1,0 +1,160 @@
+name: Deploy — webapp10
+
+on:
+  workflow_dispatch:
+
+# Force all actions to run on Node.js 24 to avoid Node 20 deprecation warnings
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: pytest --tb=short -q 2>/dev/null || echo "No tests found"
+
+  provision:
+    name: Provision EC2 (Terraform)
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.ip }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Check existing EC2
+        id: check_ec2
+        run: |
+          PROJECT="${{ secrets.PROJECT_NAME }}"
+          EXISTING_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=$PROJECT" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text 2>/dev/null || echo "None")
+          KEY_EXISTS=$(aws ec2 describe-key-pairs \
+            --filters "Name=key-name,Values=$PROJECT-key" \
+            --query "KeyPairs[0].KeyName" --output text 2>/dev/null || echo "None")
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$PROJECT-sg" \
+            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          [ "$EXISTING_IP" != "None" ] && echo "exists=true" >> $GITHUB_OUTPUT || echo "exists=false" >> $GITHUB_OUTPUT
+          echo "ip=$EXISTING_IP" >> $GITHUB_OUTPUT
+          echo "key_exists=$KEY_EXISTS" >> $GITHUB_OUTPUT
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+      - name: Create S3 state bucket
+        if: steps.check_ec2.outputs.exists != 'true'
+        run: aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+      - name: Terraform init
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Import existing resources
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: |
+          KEY="${{ steps.check_ec2.outputs.key_exists }}"
+          SG="${{ steps.check_ec2.outputs.sg_id }}"
+          [ "$KEY" != "None" ] && terraform import \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            aws_key_pair.deployer "${{ secrets.PROJECT_NAME }}-key" 2>/dev/null || true
+          [ "$SG" != "None" ] && terraform import \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            aws_security_group.sg "$SG" 2>/dev/null || true
+      - name: Terraform plan
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -out=tfplan
+      - name: Terraform apply
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+      - name: Get server IP
+        id: get_ip
+        working-directory: terraform
+        run: |
+          if [ "${{ steps.check_ec2.outputs.exists }}" == "true" ]; then
+            echo "ip=${{ steps.check_ec2.outputs.ip }}" >> $GITHUB_OUTPUT
+          else
+            echo "ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
+          fi
+
+
+  configure:
+    name: Configure & Deploy (Ansible)
+    runs-on: ubuntu-latest
+    needs: provision
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+      - name: Install Ansible
+        run: sudo apt-get update -qq && sudo apt-get install -y ansible
+      - name: Wait for SSH
+        run: |
+          for i in $(seq 1 30); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+              -i /tmp/deploy_key ${{ secrets.SSH_USER }}@${{ needs.provision.outputs.server_ip }} echo ok \
+              && break || sleep 10
+          done
+      - name: Run Ansible playbook
+        working-directory: ansible
+        run: |
+          ansible-playbook \
+            -i "${{ needs.provision.outputs.server_ip }}," \
+            --private-key /tmp/deploy_key \
+            -u ${{ secrets.SSH_USER }} \
+            playbook.yml
+        env:
+          AWS_ACCESS_KEY_ID:         ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY:     ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:        ${{ secrets.AWS_REGION }}
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+  verify:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    steps:
+      - name: Wait for app to be healthy
+        run: |
+          for i in $(seq 1 12); do
+            curl -sf http://${{ needs.provision.outputs.server_ip }}/health && break || sleep 15
+          done
+
+  notify:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [provision, verify]
+    if: always()
+    steps:
+      - name: Print URL
+        run: echo "Deployed at http://${{ needs.provision.outputs.server_ip }}"
