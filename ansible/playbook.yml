@@ -7,8 +7,7 @@
     app_port: 8080
     project: 'webapp10'
     web_server: 'nginx'
-    python_version: '3.11'
-    entrypoint: 'app.main:app'
+    java_version: '21'
 
   tasks:
     # ── System update ──────────────────────────────────────────────────────────
@@ -17,31 +16,11 @@
         update_cache: yes
         cache_valid_time: 3600
 
-    # ── Python runtime ────────────────────────────────────────────────────────
-    - name: Install pip and venv (system Python)
+    # ── Java runtime ──────────────────────────────────────────────────────────
+    - name: Install Java {{ java_version }}
       apt:
-        name:
-          - python3-pip
-          - python3-venv
-          - python3-dev
+        name: "openjdk-{{ java_version }}-jre-headless"
         state: present
-
-    - name: Add deadsnakes PPA for non-default Python version
-      shell: |
-        add-apt-repository -y ppa:deadsnakes/ppa
-        apt-get update -qq
-      args:
-        executable: /bin/bash
-      when: python_version not in ('3.10', '3', '')
-
-    - name: Install specific Python version from deadsnakes
-      apt:
-        name:
-          - "python{{ python_version }}"
-          - "python{{ python_version }}-venv"
-          - "python{{ python_version }}-dev"
-        state: present
-      when: python_version not in ('3.10', '3', '')
 
     # ── Local database installation ───────────────────────────────────────────
     - name: Install MySQL server
@@ -125,47 +104,55 @@
         mode: preserve
       notify: Restart app
 
-    - name: Create Python virtual environment
-      shell: |
-        PY=$(command -v python{{ python_version }} 2>/dev/null || command -v python3)
-        $PY -m venv {{ app_dir }}/venv
-      args:
-        executable: /bin/bash
-        creates: "{{ app_dir }}/venv"
+    - name: Find uploaded JAR
+      find:
+        paths:
+          - "{{ app_dir }}"
+        patterns: "*.jar"
+        excludes:
+          - "*-plain.jar"
+          - "*-sources.jar"
+          - "*-javadoc.jar"
+        recurse: yes
+      register: jar_search
 
-    - name: Install Python dependencies
-      shell: |
-        {{ app_dir }}/venv/bin/pip install --upgrade pip -q
-        {{ app_dir }}/venv/bin/pip install -r {{ app_dir }}/requirements.txt -q
-      args:
-        executable: /bin/bash
+    - name: Fail if no JAR found
+      fail:
+        msg: "No JAR file found under {{ app_dir }}. Ensure the build artifact was transferred correctly."
+      when: jar_search.files | length == 0
 
-    - name: Create .env file
+    - name: Set app_jar fact
+      set_fact:
+        app_jar: "{{ jar_search.files | sort(attribute='mtime') | last | json_query('path') }}"
+
+    - name: Create .env file for Spring Boot
       shell: |
         printf '' > {{ app_dir }}/.env
-        DB_URL="{{ lookup('env', 'DATABASE_URL') }}"
-        [ -n "$DB_URL" ] && printf 'DATABASE_URL=%s\n' "$DB_URL" >> {{ app_dir }}/.env || true
-        printf 'PORT={{ app_port }}\nAPP_ENV=production\n' >> {{ app_dir }}/.env
+        DB_NAME="{{ lookup('env', 'DB_NAME') | default(project | replace('-', '_') + 'db', true) }}"
+        DB_USER="{{ lookup('env', 'DB_USERNAME') | default('appuser', true) }}"
+        DB_PASS="{{ lookup('env', 'DB_PASSWORD') | default('apppass', true) }}"
+        printf 'SPRING_DATASOURCE_URL=jdbc:mysql://localhost:3306/%s?useSSL=false&allowPublicKeyRetrieval=true\n' "$DB_NAME" >> {{ app_dir }}/.env
+        printf 'SPRING_DATASOURCE_USERNAME=%s\n' "$DB_USER" >> {{ app_dir }}/.env
+        printf 'SPRING_DATASOURCE_PASSWORD=%s\n' "$DB_PASS" >> {{ app_dir }}/.env
+        printf 'SERVER_PORT={{ app_port }}\n' >> {{ app_dir }}/.env
       args:
         executable: /bin/bash
 
-    - name: Create systemd service
+    - name: Create systemd service for Spring Boot
       copy:
         dest: /etc/systemd/system/app.service
         content: |
           [Unit]
-          Description={{ project }} FastAPI app
+          Description={{ project }} Spring Boot app
           After=network.target
 
           [Service]
           User=root
           WorkingDirectory={{ app_dir }}
           EnvironmentFile={{ app_dir }}/.env
-          ExecStart={{ app_dir }}/venv/bin/gunicorn {{ entrypoint }} \
-            --workers 2 --worker-class uvicorn.workers.UvicornWorker \
-            --bind 0.0.0.0:{{ app_port }} --timeout 120
+          ExecStart=/usr/bin/java -jar {{ app_jar }} --server.port={{ app_port }}
           Restart=always
-          RestartSec=5
+          RestartSec=10
 
           [Install]
           WantedBy=multi-user.target
@@ -176,6 +163,26 @@
         enabled: yes
         state: started
         daemon_reload: yes
+
+    - name: Wait for Spring Boot to start
+      wait_for:
+        port: 8080
+        host: 127.0.0.1
+        timeout: 300
+        delay: 20
+      ignore_errors: yes
+      register: port_wait
+
+    - name: Show Spring Boot logs if startup failed
+      command: journalctl -u app -n 80 --no-pager
+      register: service_logs
+      when: port_wait is failed
+      changed_when: false
+
+    - name: Fail with logs if Spring Boot did not start
+      fail:
+        msg: "{{ service_logs.stdout }}"
+      when: port_wait is failed
 
     - name: Reload and start web server
       service:
