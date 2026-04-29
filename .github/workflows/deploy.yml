@@ -1,7 +1,7 @@
 name: Deploy — webapp10
 
 on:
-  push:
+  workflow_dispatch:
 
 # Force all actions to run on Node.js 24 to avoid Node 20 deprecation warnings
 env:
